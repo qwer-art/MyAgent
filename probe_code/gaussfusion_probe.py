@@ -43,6 +43,21 @@ def count_parameters(module):
 # ============================================================
 # 模块1: GP-Buffer 模拟器
 # ============================================================
+# 输入: batch_size (int)
+# 输出: torch.Size([batch_size, num_frames, height, width, 11])
+#       - batch_size: 批大小
+#       - num_frames: 帧数 (需能被4整除)
+#       - height, width: 图像尺寸
+#       - 11通道: RGB(3) + Depth(1) + Normal(3) + Opacity(1) + Covariance(3)
+# 参数: 64 (scene_embedding: 1×64 可学习向量)
+# 关键步骤:
+#   1. 生成11通道数据
+#   2. RGB: 使用正弦波模式
+#   3. Depth: 倾斜平面
+#   4. Normal: 简化为垂直向上
+#   5. Opacity: 中心高边缘低
+#   6. Covariance: 固定值
+# 注: scene_embedding参数未真正使用，仅用于获取device
 
 class GPBufferSimulator(nn.Module):
     """模拟3D高斯渲染的GP-Buffer输出: RGB(3)+Depth(1)+Normal(3)+Opacity(1)+Covariance(3)"""
@@ -90,6 +105,15 @@ class GPBufferSimulator(nn.Module):
 # ============================================================
 # 模块2: VAE Encoder
 # ============================================================
+# 输入: torch.Size([B, T, H, W, 3]) - RGB视频
+# 输出: torch.Size([B, T/4, H/8, W/8, 16]) - 压缩后的latent
+# 参数: 704,976
+# 压缩比: 48x (时序4x × 空间8x / 通道扩展5.33x)
+# 关键步骤:
+#   1. 时序压缩: T帧 → T/4组，每组4帧合并为12通道
+#   2. 空间编码: 3层stride=2卷积 (H,W→H/8,W/8)
+#   3. 通道投影: 12通道 → 16维latent
+#   4. 恢复batch维度: (B*T/4, 16, H/8, W/8) → (B, T/4, H/8, W/8, 16)
 
 class VAEEncoder(nn.Module):
     """VAE编码器: RGB视频 -> Latent (压缩32x)"""
@@ -117,6 +141,14 @@ class VAEEncoder(nn.Module):
 # ============================================================
 # 模块3: VAE Decoder
 # ============================================================
+# 输入: torch.Size([B, T/4, H/8, W/8, 16]) - 压缩后的latent
+# 输出: torch.Size([B, T, H, W, 3]) - 恢复的RGB视频
+# 参数: 704,972
+# 解压比: 48x (T/4→T, H/8→H, W/8→W, 16→3)
+# 关键步骤:
+#   1. 编码格式: (B, T/4, H/8, W/8, 16) → (B*T/4, 16, H/8, W/8)
+#   2. 空间解码: 3层转置卷积 (H/8,W/8 → H,W)
+#   3. 时序恢复: (B*T/4, 12, H, W) → (B, T, H, W, 3)
 
 class VAEDecoder(nn.Module):
     """VAE解码器: Latent -> RGB视频"""
@@ -142,6 +174,15 @@ class VAEDecoder(nn.Module):
 # ============================================================
 # 模块4: GP-Buffer Encoder
 # ============================================================
+# 输入: torch.Size([B, T, H, W, 11]) - GP-Buffer (11通道几何数据)
+# 输出: torch.Size([B, T/4, H/8, W/8, 64]) - 几何特征向量
+# 参数: 260,384
+# 压缩: T→T/4 (时序), H,W→H/8,W/8 (空间), 11→64 (通道)
+# 关键步骤:
+#   1. 时序压缩: 11通道 × 4帧 = 44通道
+#   2. 空间编码: 3层stride=2卷积
+#   3. 通道投影: 44 → 64维几何特征
+# 注: 与VAE Encoder相同的压缩策略
 
 class GPBufferEncoder(nn.Module):
     """GP-Buffer编码器: 11通道 -> 几何特征"""
@@ -169,6 +210,19 @@ class GPBufferEncoder(nn.Module):
 # ============================================================
 # 模块5: Geometry Adapter (核心创新)
 # ============================================================
+# 输入:
+#   z_G:      torch.Size([B, T/4, H/8, W/8, 64])  - 几何特征
+#   z_latent: torch.Size([B, T/4, H/8, W/8, 16])  - RGB latent
+#   z_text:   torch.Size([B, 768])              - 文本特征 (可选)
+# 输出: torch.Size([B, T/4, H/8, W/8, 16]) - 条件化特征
+# 参数: 23,457
+# 关键步骤:
+#   1. 几何投影: 64维 → 16维 (geo_proj)
+#   2. 文本融合: 768维 → 16维，加到几何特征上 (text_proj)
+#   3. 门控计算: MLP(z_latent + z_G) → gate ∈ [0,1]
+#   4. 特征融合: concat(z_latent, z_G_proj) → Conv → z_fused
+#   5. 门控输出: x_g = gate * z_fused + (1-gate) * z_latent
+# 核心创新: 自适应学习何时信任几何先验
 
 class GeometryAdapter(nn.Module):
     """几何适配器: 将几何特征注入到生成流程"""
@@ -219,6 +273,16 @@ class GeometryAdapter(nn.Module):
 # ============================================================
 # 模块6: 简化的DiT Backbone
 # ============================================================
+# SimpleDiTBlock:
+#   输入:
+#     x:         torch.Size([N, C])  - 展平的latent (N=B*T*H*W)
+#     condition: torch.Size([N, C])  - 展平的条件
+#   输出: torch.Size([N, C]) - 处理后的特征
+#   参数: 每层约9K参数
+#   关键步骤:
+#     1. Self-Attention: latent自身信息整合
+#     2. Cross-Attention: 用条件指导latent (核心融合)
+#     3. FFN: 特征变换
 
 class SimpleDiTBlock(nn.Module):
     """简化的DiT Block"""
@@ -252,6 +316,21 @@ class SimpleDiTBlock(nn.Module):
         return x
 
 
+# SimpleDiT:
+#   输入:
+#     z_t:       torch.Size([B, T/4, H/8, W/8, 16]) - 当前latent
+#     t:         torch.Size([B])              - 时间步
+#     condition:  torch.Size([B, T/4, H/8, W/8, 16]) - 几何条件
+#   输出: torch.Size([B, T/4, H/8, W/8, 16]) - 预测的速度v
+#   参数: 约9K (简化版)
+#   关键步骤:
+#     1. 时间嵌入: t → t_embed → 广播到所有位置
+#     2. 展平: (B,T,H,W,C) → (N, C), N=B*T*H*W
+#     3. 时间注入: x = z_flat + t_flat
+#     4. DiT层: Self-Attn + Cross-Attn + FFN (2层)
+#     5. 输出投影: LayerNorm + Linear
+#     6. 恢复形状: (N, C) → (B, T, H, W, C)
+
 class SimpleDiT(nn.Module):
     """简化的DiT用于Flow Matching"""
 
@@ -282,6 +361,21 @@ class SimpleDiT(nn.Module):
 # 模块7: Flow Matching
 # ============================================================
 
+# FlowMatchingTraining (训练):
+#   compute_loss输入:
+#     z_corrupted: torch.Size([B, T/4, H/8, W/8, 16]) - 损坏的latent
+#     z_clean:     torch.Size([B, T/4, H/8, W/8, 16]) - 干净的latent
+#     condition:    torch.Size([B, T/4, H/8, W/8, 16]) - 几何条件
+#   输出:
+#     loss: 标量 - MSE损失
+#     v_pred: torch.Size([B, T/4, H/8, W/8, 16]) - 预测的速度
+#   关键步骤:
+#     1. 采样时间步: t ~ U(0,1)
+#     2. 计算插值: z_t = t*z_clean + (1-t)*z_corrupted
+#     3. 计算真实速度: v_gt = z_clean - z_corrupted
+#     4. DiT预测速度: v_pred = DiT(z_t, t, condition)
+#     5. MSE损失: loss = MSE(v_pred, v_gt)
+
 class FlowMatchingTraining(nn.Module):
     """Flow Matching训练"""
 
@@ -298,6 +392,20 @@ class FlowMatchingTraining(nn.Module):
         loss = F.mse_loss(v_pred, v_gt)
         return loss, v_pred
 
+
+# FlowMatchingInference (推理):
+#   forward输入:
+#     z_corrupted: torch.Size([B, T/4, H/8, W/8, 16]) - 损坏的latent
+#     condition:    torch.Size([B, T/4, H/8, W/8, 16]) - 几何条件
+#   输出:
+#     z_refined: torch.Size([B, T/4, H/8, W/8, 16]) - 精化的latent
+#   关键步骤:
+#     1. 初始化: z_t = z_corrupted
+#     2. 循环num_steps次:
+#        a. 设置当前时间: t = step / num_steps
+#        b. 预测速度: v = DiT(z_t, t, condition)
+#        c. 更新latent: z_t = z_t + v * dt
+#     3. 返回精化后的latent
 
 class FlowMatchingInference(nn.Module):
     """Flow Matching推理"""
