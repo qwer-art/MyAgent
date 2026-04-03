@@ -45,3 +45,6 @@ Thumbs.db
 
 # Memory
 .claude/
+
+# Prompt
+prompt
