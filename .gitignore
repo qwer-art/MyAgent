@@ -2,6 +2,9 @@
 raw_paper/
 raw_code/
 
+# Working directories
+workdirs/
+
 # Python
 __pycache__/
 *.py[cod]
