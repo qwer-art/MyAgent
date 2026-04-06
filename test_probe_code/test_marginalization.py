@@ -43,12 +43,13 @@ class Feature:
     u_ref: float
     v_ref: float
     rho: float
+    ref_frame_id: int  # 参考帧ID（新增）
 
 
 @dataclass
 class Observation:
     """观测"""
-    frame_id: int
+    frame_idx: int  # 窗口内的帧索引（0~N-1）
     feature_id: int
     pixel: np.ndarray  # [2,]
 
@@ -56,7 +57,7 @@ class Observation:
 @dataclass
 class Frame:
     """帧"""
-    id: int
+    idx: int  # 窗口内的索引（0~N-1）
     pose: Pose
     timestamp: float
 
@@ -76,6 +77,8 @@ class VINSProblem:
     """
     VINS优化问题（遵循4函数标准）
 
+    使用连续索引而非ID，简化滑窗操作
+
     residual(theta): 视觉残差 + 先验残差
     jacobian(theta): 视觉Jacobian + 先验Jacobian
     cost(theta): 0.5 * sum(r²)
@@ -83,8 +86,8 @@ class VINSProblem:
     """
 
     def __init__(self,
-                 frames: Dict[int, Frame],
-                 features: Dict[int, Feature],
+                 frames: List[Frame],  # 改用List，按索引存储
+                 features: Dict[int, Feature],  # feature仍用Dict（因为ID不连续）
                  observations: List[Observation],
                  focal_length: float = 500.0,
                  cx: float = 320.0,
@@ -92,13 +95,13 @@ class VINSProblem:
                  prior: Optional[PriorInfo] = None) -> None:
         """
         Args:
-            frames: 当前窗口内的帧
-            features: 特征点
-            observations: 观测
+            frames: 当前窗口内的帧（按索引顺序，frames[0]是第0帧）
+            features: 特征点字典
+            observations: 观测列表
             focal_length, cx, cy: 相机内参
             prior: 先验信息（来自边缘化）
         """
-        self.frames = frames
+        self.frames = frames  # List[Frame]，frames[i]是第i帧
         self.features = features
         self.observations = observations
         self.focal_length = focal_length
@@ -110,22 +113,7 @@ class VINSProblem:
         self.n_points = len(features)
 
         # 只统计窗口内的观测数量
-        self.n_obs = sum(1 for obs in observations if obs.frame_id in frames)
-
-        # 计算参考帧映射
-        self.ref_pose_for_point = self._compute_ref_poses()
-
-    def _compute_ref_poses(self) -> Dict[int, int]:
-        """计算每个特征点的参考帧"""
-        ref_map = {}
-        for feature in self.features.values():
-            for obs in self.observations:
-                if obs.feature_id == feature.id:
-                    ref_map[feature.id] = obs.frame_id
-                    break
-            if feature.id not in ref_map:
-                ref_map[feature.id] = min(self.frames.keys())
-        return ref_map
+        self.n_obs = sum(1 for obs in observations if obs.frame_idx < len(frames))
 
     def _visual_residual(self, theta: np.ndarray) -> np.ndarray:
         """计算视觉重投影残差"""
@@ -135,17 +123,15 @@ class VINSProblem:
         valid_obs_idx = 0
 
         for obs in self.observations:
-            pose_idx = obs.frame_id
+            pose_idx = obs.frame_idx
             feature_id = obs.feature_id
 
             # 跳过不在窗口内的观测
-            if pose_idx not in self.frames:
+            if pose_idx >= len(self.frames):
                 continue
 
-            # 提取pose
-            pose_idx_list = sorted(self.frames.keys())
-            local_idx = pose_idx_list.index(pose_idx)
-            pose_start = local_idx * 6
+            # 提取pose（直接使用pose_idx作为索引）
+            pose_start = pose_idx * 6
             pose_vec = theta[pose_start:pose_start + 6]
             R = Rotation.from_rotvec(pose_vec[:3]).as_matrix()
             t = pose_vec[3:]
@@ -161,7 +147,7 @@ class VINSProblem:
             v_ref = feature.v_ref
 
             # 逆深度转3D
-            ref_pose_idx = self.ref_pose_for_point.get(feature_id, pose_idx)
+            ref_pose_idx = feature.ref_frame_id
             P_w = self._inverse_depth_to_3d(rho, u_ref, v_ref, ref_pose_idx, theta)
 
             # 投影
@@ -185,17 +171,18 @@ class VINSProblem:
         Y_c = (v_ref - self.cy) * Z_c / self.focal_length
         P_c = np.array([X_c, Y_c, Z_c])
 
-        # 找到参考帧的local index
-        ref_pose_id_list = sorted(self.frames.keys())
-        if ref_pose_idx in ref_pose_id_list:
-            local_ref_idx = ref_pose_id_list.index(ref_pose_idx)
+        # 找到参考帧的索引（直接使用ref_pose_idx）
+        if ref_pose_idx < len(self.frames):
+            pose_start = ref_pose_idx * 6
+            pose_vec = theta[pose_start:pose_start + 6]
+            R_ref = Rotation.from_rotvec(pose_vec[:3]).as_matrix()
+            t_ref = pose_vec[3:]
         else:
-            local_ref_idx = 0
-
-        pose_start = local_ref_idx * 6
-        pose_vec = theta[pose_start:pose_start + 6]
-        R_ref = Rotation.from_rotvec(pose_vec[:3]).as_matrix()
-        t_ref = pose_vec[3:]
+            # 如果参考帧不在当前窗口，使用第0帧
+            pose_start = 0
+            pose_vec = theta[pose_start:pose_start + 6]
+            R_ref = Rotation.from_rotvec(pose_vec[:3]).as_matrix()
+            t_ref = pose_vec[3:]
 
         P_w = R_ref.T @ (P_c - t_ref)
         return P_w
@@ -267,17 +254,15 @@ class VINSProblem:
         valid_obs_idx = 0
 
         for obs in self.observations:
-            pose_idx = obs.frame_id
+            pose_idx = obs.frame_idx
             feature_id = obs.feature_id
 
             # 跳过不在窗口内的观测
-            if pose_idx not in self.frames:
+            if pose_idx >= len(self.frames):
                 continue
 
-            # 提取pose
-            pose_idx_list = sorted(self.frames.keys())
-            local_idx = pose_idx_list.index(pose_idx)
-            pose_start = local_idx * 6
+            # 提取pose（直接使用pose_idx作为索引）
+            pose_start = pose_idx * 6
             pose_vec = theta[pose_start:pose_start + 6]
             R = Rotation.from_rotvec(pose_vec[:3]).as_matrix()
             t = pose_vec[3:]
@@ -293,7 +278,7 @@ class VINSProblem:
             v_ref = feature.v_ref
 
             # 将逆深度转换为3D点
-            ref_pose_idx = self.ref_pose_for_point.get(feature_id, pose_idx)
+            ref_pose_idx = feature.ref_frame_id
             P_w = self._inverse_depth_to_3d(rho, u_ref, v_ref, ref_pose_idx, theta)
 
             # 变换到当前相机系
@@ -347,10 +332,8 @@ class VINSProblem:
             if ref_pose_idx == pose_idx:
                 dP_c_drho = dP_c_ref_drho
             else:
-                # 提取参考帧位姿
-                ref_pose_idx_list = sorted(self.frames.keys())
-                local_ref_idx = ref_pose_idx_list.index(ref_pose_idx)
-                ref_pose_start = local_ref_idx * 6
+                # 提取参考帧位姿（直接使用ref_pose_idx作为索引）
+                ref_pose_start = ref_pose_idx * 6
                 ref_pose_vec = theta[ref_pose_start:ref_pose_start + 6]
                 R_ref = Rotation.from_rotvec(ref_pose_vec[:3]).as_matrix()
 
@@ -465,17 +448,17 @@ class GaussNewtonOptimizer:
 
 class SlidingWindow:
     """
-    VINS风格的滑动窗口
+    VINS风格的滑动窗口（使用连续索引）
 
     流程:
-    1. 维护窗口大小为N的帧
+    1. 维护窗口大小为N的帧列表
     2. 窗口满后，触发边缘化
-    3. 边缘化最老帧，构建先验
+    3. 边缘化最老帧（索引0），构建先验
     """
 
     def __init__(self, window_size: int = 7):
         self.window_size = window_size
-        self.frames: Dict[int, Frame] = {}  # 窗口内的帧
+        self.frames: List[Frame] = []  # 窗口内的帧（按索引顺序）
         self.features: Dict[int, Feature] = {}  # 所有特征点
         self.observations: List[Observation] = []  # 所有观测
         self.prior: Optional[PriorInfo] = None  # 先验信息
@@ -484,11 +467,15 @@ class SlidingWindow:
         """
         添加新帧
 
+        Args:
+            frame: 要添加的帧（自动分配索引）
+
         Returns:
             True if 触发边缘化
         """
-        self.frames[frame.id] = frame
-        print(f"[添加帧] ID={frame.id}, 窗口帧数={len(self.frames)}")
+        frame.idx = len(self.frames)  # 自动分配索引
+        self.frames.append(frame)
+        print(f"[添加帧] idx={frame.idx}, 窗口帧数={len(self.frames)}")
 
         # 检查是否需要边缘化
         if len(self.frames) > self.window_size:
@@ -500,26 +487,137 @@ class SlidingWindow:
                           n_poses_at_marginalization: int,
                           n_points_at_marginalization: int) -> None:
         """
-        边缘化最老帧
+        边缘化最老帧（索引0，使用连续索引简化操作）
 
         Args:
             theta_at_marginalization: 边缘化时刻的状态向量
             n_poses_at_marginalization: 边缘化时刻的帧数
             n_points_at_marginalization: 边缘化时刻的特征点数
         """
-        oldest_frame_id = min(self.frames.keys())
+        oldest_frame_idx = 0  # 总是边缘化索引0的帧
         print(f"\n{'='*80}")
-        print(f"[边缘化] 边缘化第{oldest_frame_id}帧")
+        print(f"[边缘化] 边缘化第{oldest_frame_idx}帧")
         print(f"{'='*80}")
 
         print(f"  边缘化时刻: {n_poses_at_marginalization}帧, {n_points_at_marginalization}点")
         print(f"  当前时刻: {len(self.frames)}帧, {len(self.features)}点")
 
-        # 创建临时的Problem（使用边缘化时刻的状态）
-        temp_frames = {fid: self.frames[fid] for fid in sorted(self.frames.keys())[:n_poses_at_marginalization]}
+        # ============================================================
+        # 步骤1: 分析特征点的观测情况
+        # ============================================================
+        features_to_marginalize = []  # 只在边缘化帧观测的点
+        features_to_change_ref = []   # 参考帧是边缘化帧，但在其他帧也有观测
+        features_to_keep = []         # 不受影响的点
+
+        for feature_id, feature in self.features.items():
+            if feature_id >= n_points_at_marginalization:
+                # 新点，不在边缘化时刻存在，跳过
+                features_to_keep.append(feature_id)
+                continue
+
+            # 找到该特征点的所有观测帧
+            obs_frames = [obs.frame_idx for obs in self.observations
+                          if obs.feature_id == feature_id and obs.frame_idx < n_poses_at_marginalization]
+
+            if len(obs_frames) == 0:
+                # 没有观测，保留（虽然不应该发生）
+                features_to_keep.append(feature_id)
+            elif len(obs_frames) == 1 and obs_frames[0] == oldest_frame_idx:
+                # 情况1: 只在边缘化帧观测 → 边缘化
+                features_to_marginalize.append(feature_id)
+            elif feature.ref_frame_id == oldest_frame_idx:
+                # 情况2: 参考帧是边缘化帧，但在其他帧也有观测 → 转换参考帧
+                features_to_change_ref.append(feature_id)
+            else:
+                # 情况3: 参考帧不是边缘化帧 → 保留
+                features_to_keep.append(feature_id)
+
+        print(f"\n  特征点分类:")
+        print(f"    情况1（只在该帧观测，需删除）: {len(features_to_marginalize)}个")
+        print(f"    情况2（参考帧是该帧，需转换）: {len(features_to_change_ref)}个")
+        print(f"    情况3（不受影响）: {len(features_to_keep)}个")
+
+        # ============================================================
+        # 步骤2: 为情况2的特征点转换参考帧
+        # ============================================================
+        for feature_id in features_to_change_ref:
+            # 找到该点在其他帧的首次观测
+            other_frames = [obs.frame_idx for obs in self.observations
+                           if obs.feature_id == feature_id and obs.frame_idx != oldest_frame_idx
+                           and obs.frame_idx < n_poses_at_marginalization]
+
+            if len(other_frames) == 0:
+                # 不应该发生，因为情况2要求在其他帧有观测
+                continue
+
+            new_ref_frame = min(other_frames)  # 选择最早的帧作为新参考帧
+
+            # 重新计算逆深度参数（基于新参考帧）
+            feature = self.features[feature_id]
+
+            # 从旧参考帧恢复3D点
+            old_ref_frame = self.frames[oldest_frame_idx]
+            rho_old = feature.rho
+            u_ref_old = feature.u_ref
+            v_ref_old = feature.v_ref
+
+            Z_c_old = 1.0 / (rho_old + 1e-6)
+            X_c_old = (u_ref_old - 320.0) * Z_c_old / 500.0
+            Y_c_old = (v_ref_old - 240.0) * Z_c_old / 500.0
+            P_c_old = np.array([X_c_old, Y_c_old, Z_c_old])
+
+            # 转到世界坐标
+            P_w = old_ref_frame.pose.R.T @ (P_c_old - old_ref_frame.pose.t)
+
+            # 转到新参考帧
+            new_ref_frame_obj = self.frames[new_ref_frame]
+            P_c_new = new_ref_frame_obj.pose.R @ P_w + new_ref_frame_obj.pose.t
+
+            # 重新计算u_ref, v_ref, rho
+            u_ref_new = 500.0 * P_c_new[0] / P_c_new[2] + 320.0
+            v_ref_new = 500.0 * P_c_new[1] / P_c_new[2] + 240.0
+            rho_new = 1.0 / P_c_new[2]
+
+            # 更新特征点
+            feature.u_ref = u_ref_new
+            feature.v_ref = v_ref_new
+            feature.rho = rho_new
+            feature.ref_frame_id = new_ref_frame
+
+            print(f"    点{feature_id}: 参考帧 {oldest_frame_idx}→{new_ref_frame}")
+
+        # ============================================================
+        # 步骤3: 构建参数向量排序（简化版：使用连续索引）
+        # ============================================================
+        # 边缘化时刻的帧索引（不包括新添加的帧）
+        poses_margin = set(range(n_poses_at_marginalization))
+
+        # 参数顺序: [保留的pose, 要边缘化的pose, 保留的feature, 要边缘化的feature]
+        pose_keep_ids = sorted([idx for idx in poses_margin if idx != oldest_frame_idx])
+        pose_marg_ids = [oldest_frame_idx]  # 总是边缘化索引0
+
+        # 只处理边缘化时刻存在的特征点
+        features_margin = set(range(n_points_at_marginalization))
+        feature_keep_ids = sorted([f for f in (features_to_keep + features_to_change_ref)
+                                   if f in features_margin])
+        feature_marg_ids = sorted([f for f in features_to_marginalize
+                                   if f in features_margin])
+
+        print(f"\n  参数分块:")
+        print(f"    保留的pose: {pose_keep_ids}")
+        print(f"    边缘化的pose: {pose_marg_ids}")
+        print(f"    保留的feature: {len(feature_keep_ids)}个")
+        print(f"    边缘化的feature: {len(feature_marg_ids)}个")
+
+        # ============================================================
+        # 步骤4: 创建边缘化时刻的Problem并计算Jacobian
+        # ============================================================
+        # 提取边缘化时刻的数据（前N个帧，前M个特征点）
+        temp_frames = self.frames[:n_poses_at_marginalization]  # 直接切片
         temp_features = {fid: self.features[fid] for fid in sorted(self.features.keys())[:n_points_at_marginalization]}
         temp_observations = [obs for obs in self.observations
-                            if obs.frame_id in temp_frames and obs.feature_id in temp_features]
+                            if obs.frame_idx < n_poses_at_marginalization
+                            and obs.feature_id in temp_features]
 
         problem = VINSProblem(
             frames=temp_frames,
@@ -530,24 +628,81 @@ class SlidingWindow:
             cx=320.0, cy=240.0
         )
 
-        # 计算Jacobian和残差（基于边缘化时刻的theta）
         J = problem.jacobian(theta_at_marginalization)
         r = problem.residual(theta_at_marginalization)
 
-        print(f"  Jacobian形状: {J.shape}")
+        print(f"\n  Jacobian形状: {J.shape}")
         print(f"  残差范数: {np.linalg.norm(r):.6f}")
 
-        # 边缘化第0帧（前6个参数）
-        m = 6
+        # ============================================================
+        # 步骤5: 重排Jacobian列以匹配参数分块
+        # ============================================================
+        # 原始顺序: pose0(6维), pose1(6维), ..., pose6(6维), feature0(1维), ..., feature34(1维)
+        # 目标顺序: pose_keep, pose_marg, feature_keep, feature_marg
 
-        # 构建信息矩阵: H = J^T @ J
-        H_mm = J[:, :m].T @ J[:, :m] + 1e-6 * np.eye(m)  # (6x6)
-        H_mr = J[:, :m].T @ J[:, m:]  # (6x106)
-        H_rm = J[:, m:].T @ J[:, :m]  # (106x6)
-        H_rr = J[:, m:].T @ J[:, m:]  # (106x106)
+        # 构建列索引映射
+        n_poses_margin = n_poses_at_marginalization
 
-        r_m = J[:, :m].T @ r  # (6,)
-        r_r = J[:, m:].T @ r  # (106,)
+        # 获取边缘化时刻的特征点排序列表
+        all_feature_ids_margin = sorted(temp_features.keys())
+        feature_id_to_idx = {fid: i for i, fid in enumerate(all_feature_ids_margin)}
+
+        # 旧索引 -> 新位置的映射
+        # 策略：保留参数全部在前，边缘化参数全部在后（各自内部保持顺序）
+        old_to_new_col = {}
+        new_col = 0
+
+        # 1. 保留的pose
+        for pid in pose_keep_ids:
+            for i in range(6):
+                old_idx = pid * 6 + i
+                old_to_new_col[old_idx] = new_col
+                new_col += 1
+
+        # 2. 保留的feature
+        feat_idx_offset = n_poses_margin * 6
+        for fid in feature_keep_ids:
+            if fid in feature_id_to_idx:
+                old_idx = feat_idx_offset + feature_id_to_idx[fid]
+                old_to_new_col[old_idx] = new_col
+                new_col += 1
+
+        # 3. 边缘化的pose
+        for pid in pose_marg_ids:
+            for i in range(6):
+                old_idx = pid * 6 + i
+                old_to_new_col[old_idx] = new_col
+                new_col += 1
+
+        # 4. 边缘化的feature
+        for fid in feature_marg_ids:
+            if fid in feature_id_to_idx:
+                old_idx = feat_idx_offset + feature_id_to_idx[fid]
+                old_to_new_col[old_idx] = new_col
+                new_col += 1
+
+        # 重排Jacobian的列
+        J_reordered = np.zeros((J.shape[0], J.shape[1]))
+        for old_col, new_col in old_to_new_col.items():
+            J_reordered[:, new_col] = J[:, old_col]
+
+        # ============================================================
+        # 步骤6: 执行Schur补
+        # ============================================================
+        m = len(pose_marg_ids) * 6 + len(feature_marg_ids) * 1  # 边缘化参数总数
+        r_total = J_reordered.shape[1] - m  # 保留参数总数
+
+        print(f"\n  边缘化参数数: {m} (pose: {len(pose_marg_ids)*6}, feature: {len(feature_marg_ids)})")
+        print(f"  保留参数数: {r_total}")
+
+        # 修正：边缘化参数在最后m列
+        H_mm = J_reordered[:, -m:].T @ J_reordered[:, -m:] + 1e-6 * np.eye(m)
+        H_mr = J_reordered[:, -m:].T @ J_reordered[:, :-m]
+        H_rm = J_reordered[:, :-m].T @ J_reordered[:, -m:]
+        H_rr = J_reordered[:, :-m].T @ J_reordered[:, :-m]
+
+        r_m = J_reordered[:, -m:].T @ r
+        r_r = J_reordered[:, :-m].T @ r
 
         # Schur补
         H_mm_inv = np.linalg.inv(H_mm)
@@ -556,25 +711,56 @@ class SlidingWindow:
 
         print(f"  Schur补完成: H_rr_new {H_rr_new.shape}")
 
-        # 构建先验
+        # ============================================================
+        # 步骤7: 构建先验
+        # ============================================================
+        # 说明: 先验不是真实观测，而是对参数空间的约束
+        #   - 先验的"观测维度" = 保留参数维度（这里是69）
+        #   - 先验的"参数维度" = 保留参数维度（这里是69）
+        #   - J_prior.T @ J_prior 提供先验Hessian (H_rr_new)
+        #   - J_prior.T @ r_prior 提供先验梯度 (r_r_new)
         try:
             H_rr_reg = H_rr_new + 1e-8 * np.eye(H_rr_new.shape[0])
             L = np.linalg.cholesky(H_rr_reg)
-            J_prior = L.T
-            r_prior = np.linalg.solve(L.T, r_r_new)
+            # 构造先验残差和Jacobian，使其等价于先验信息
+            # J_prior = L.T, 则 J_prior.T @ J_prior = L @ L.T = H_rr_new
+            # r_prior = solve(L, r_r_new), 则 J_prior.T @ r_prior = r_r_new
+            J_prior = L.T  # (n_retained, n_retained)
+            r_prior = np.linalg.solve(L, r_r_new)  # (n_retained,)
 
             self.prior = PriorInfo(J=J_prior, r=r_prior)
-            print(f"  先验构建成功: J形状={J_prior.shape}")
+            print(f"  先验构建成功: J形状={J_prior.shape}（观测维度=保留参数维度={J_prior.shape[0]}）")
         except np.linalg.LinAlgError:
             print(f"  警告: 先验构建失败")
 
-        # 移除最老帧
-        del self.frames[oldest_frame_id]
+        # ============================================================
+        # 步骤8: 清理数据（简化版：直接pop索引0）
+        # ============================================================
+        # 移除边缘化的帧
+        self.frames.pop(0)  # 移除索引0的帧
 
-        # 清理观测
-        self.observations = [obs for obs in self.observations if obs.frame_id != oldest_frame_id]
+        # 更新所有观测的frame_idx（如果大于0则减1）
+        for obs in self.observations:
+            if obs.frame_idx > 0:
+                obs.frame_idx -= 1
 
-        print(f"  移除帧{oldest_frame_id}，剩余帧数={len(self.frames)}")
+        # 更新所有特征点的ref_frame_id（如果大于0则减1）
+        for feature in self.features.values():
+            if feature.ref_frame_id > 0:
+                feature.ref_frame_id -= 1
+
+        # 移除边缘化的特征点
+        for fid in features_to_marginalize:
+            if fid in self.features:
+                del self.features[fid]
+
+        # 清理观测（移除与边缘化帧或边缘化特征点相关的观测）
+        self.observations = [obs for obs in self.observations
+                             if obs.frame_idx < len(self.frames)
+                             and obs.feature_id in self.features]
+
+        print(f"  移除帧{oldest_frame_idx}，剩余帧数={len(self.frames)}")
+        print(f"  移除{len(features_to_marginalize)}个特征点，剩余点数={len(self.features)}")
         print(f"{'='*80}\n")
 
     def get_theta(self) -> np.ndarray:
@@ -585,9 +771,8 @@ class SlidingWindow:
 
         theta = np.zeros(theta_size)
 
-        # 填充pose（按frame_id排序）
-        for i, frame_id in enumerate(sorted(self.frames.keys())):
-            frame = self.frames[frame_id]
+        # 填充pose（按索引顺序）
+        for i, frame in enumerate(self.frames):
             rotvec = Rotation.from_matrix(frame.pose.R).as_rotvec()
             theta[i*6:i*6+3] = rotvec
             theta[i*6+3:i*6+6] = frame.pose.t
@@ -628,7 +813,7 @@ class SlidingWindow:
         """打印当前状态"""
         print(f"\n[窗口状态]")
         print(f"  窗口大小: {len(self.frames)}/{self.window_size}")
-        print(f"  帧IDs: {sorted(self.frames.keys())}")
+        print(f"  帧索引: [0, 1, ..., {len(self.frames)-1}]")
         print(f"  特征点数: {len(self.features)}")
         print(f"  观测数: {len(self.observations)}")
         print(f"  先验: {'有' if self.prior else '无'}")
@@ -663,7 +848,7 @@ def test_vins_marginalization():
     for i in range(7):
         R = Rotation.from_euler('z', np.radians(i * 2)).as_matrix()  # 小旋转
         t = np.array([float(i) * 0.5, 0.0, 0.0])  # 每帧移动0.5m
-        frame = Frame(id=i, pose=Pose(R, t), timestamp=float(i))
+        frame = Frame(idx=-1, pose=Pose(R, t), timestamp=float(i))  # idx会被add_frame自动设置
         window.add_frame(frame)
 
     # 创建特征点和观测（参考test_bundle_adjustment.py的正确方式）
@@ -677,7 +862,7 @@ def test_vins_marginalization():
         frame_i = window.frames[i]
 
         # 每帧创建5个特征点
-        for _ in range(5):
+        for j in range(5):
             # 在3D空间中随机创建一个点（在相机前方）
             # 使用相对于当前帧的相机坐标
             depth = 5.0 + np.random.rand() * 3.0  # 深度5-8米
@@ -698,32 +883,51 @@ def test_vins_marginalization():
                 id=feature_id_counter,
                 u_ref=u_ref,
                 v_ref=v_ref,
-                rho=rho
+                rho=rho,
+                ref_frame_id=i  # 当前帧作为参考帧
             )
             window.add_feature(feature)
 
-            # 在当前帧及后续2帧中创建观测
-            for k in range(i, min(i+3, 7)):
-                frame_k = window.frames[k]
-
-                # 将3D点变换到第k帧相机系
-                P_c_k = frame_k.pose.R @ P_w + frame_k.pose.t
-
-                # 检查深度
-                if P_c_k[2] < 0.5:
-                    continue
-
-                # 投影
-                u_k = focal_length * P_c_k[0] / P_c_k[2] + cx
-                v_k = focal_length * P_c_k[1] / P_c_k[2] + cy
-
-                # 添加小噪声
-                obs = Observation(
-                    frame_id=k,
-                    feature_id=feature_id_counter,
-                    pixel=np.array([u_k, v_k]) + np.random.randn(2) * 0.5
-                )
-                window.add_observation(obs)
+            # 第0帧：前2个点只在第0帧观测，后3个点在0、1、2帧观测
+            if i == 0:
+                if j < 2:
+                    # 只在第0帧观测（情况1：将被边缘化）
+                    obs = Observation(
+                        frame_idx=0,
+                        feature_id=feature_id_counter,
+                        pixel=np.array([u_ref, v_ref]) + np.random.randn(2) * 0.5
+                    )
+                    window.add_observation(obs)
+                else:
+                    # 在第0、1、2帧观测（情况2：参考帧转换）
+                    for k in range(3):  # 0, 1, 2帧
+                        frame_k = window.frames[k]
+                        P_c_k = frame_k.pose.R @ P_w + frame_k.pose.t
+                        if P_c_k[2] < 0.5:
+                            continue
+                        u_k = focal_length * P_c_k[0] / P_c_k[2] + cx
+                        v_k = focal_length * P_c_k[1] / P_c_k[2] + cy
+                        obs = Observation(
+                            frame_idx=k,
+                            feature_id=feature_id_counter,
+                            pixel=np.array([u_k, v_k]) + np.random.randn(2) * 0.5
+                        )
+                        window.add_observation(obs)
+            else:
+                # 其他帧：在当前帧及后续2帧中创建观测
+                for k in range(i, min(i+3, 7)):
+                    frame_k = window.frames[k]
+                    P_c_k = frame_k.pose.R @ P_w + frame_k.pose.t
+                    if P_c_k[2] < 0.5:
+                        continue
+                    u_k = focal_length * P_c_k[0] / P_c_k[2] + cx
+                    v_k = focal_length * P_c_k[1] / P_c_k[2] + cy
+                    obs = Observation(
+                        frame_idx=k,
+                        feature_id=feature_id_counter,
+                        pixel=np.array([u_k, v_k]) + np.random.randn(2) * 0.5
+                    )
+                    window.add_observation(obs)
 
             feature_id_counter += 1
 
@@ -778,7 +982,7 @@ def test_vins_marginalization():
     # 添加第8帧
     R = Rotation.from_euler('z', np.radians(7 * 2)).as_matrix()
     t = np.array([3.5, 0.0, 0.0])  # 第8帧
-    frame_8 = Frame(id=7, pose=Pose(R, t), timestamp=7.0)  # ID=7（接在0-6之后）
+    frame_8 = Frame(idx=-1, pose=Pose(R, t), timestamp=7.0)  # idx会被add_frame自动设置
 
     should_marginalize = window.add_frame(frame_8)
 
@@ -788,8 +992,8 @@ def test_vins_marginalization():
         n_points_at_margin = len(window.features)
         window.marginalize_oldest(theta_opt, n_poses_at_margin, n_points_at_margin)
 
-        # 为第8帧添加新特征点和观测
-        frame_7 = window.frames[7]
+        # 为第8帧（现在索引是6）添加新特征点和观测
+        frame_6 = window.frames[6]  # 边缘化后第7帧变成了第6帧
         for j in range(35, 40):
             # 在3D空间中随机创建一个点
             depth = 5.0 + np.random.rand() * 3.0
@@ -798,7 +1002,7 @@ def test_vins_marginalization():
             z_c = depth
 
             # 转换到世界坐标
-            P_w = frame_7.pose.R.T @ np.array([x_c, y_c, z_c]) - frame_7.pose.R.T @ frame_7.pose.t
+            P_w = frame_6.pose.R.T @ np.array([x_c, y_c, z_c]) - frame_6.pose.R.T @ frame_6.pose.t
 
             # 投影获取u_ref, v_ref
             u_ref = 500.0 * x_c / z_c + 320.0
@@ -810,13 +1014,14 @@ def test_vins_marginalization():
                 id=j,
                 u_ref=u_ref,
                 v_ref=v_ref,
-                rho=rho
+                rho=rho,
+                ref_frame_id=6  # 第6帧（原来的第7帧）作为参考帧
             )
             window.add_feature(feature)
 
             # 添加观测
             obs = Observation(
-                frame_id=7,
+                frame_idx=7,  # 第7帧（索引7）
                 feature_id=j,
                 pixel=np.array([u_ref, v_ref]) + np.random.randn(2) * 0.5
             )
