@@ -15,10 +15,67 @@ IESKF的核心思想:
 
 误差状态 (5维):
     [δx, δy, δvx, δvy, δθ]^T
+
+测量模型: 2D激光雷达点云配准 (参考FAST-LIO2)
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
+
+
+class Lidar2D:
+    """2D激光雷达模拟器"""
+
+    def __init__(self, map_points, num_rays=180, max_range=20.0):
+        """
+        Args:
+            map_points: 地图点云 (N x 2)
+            num_rays: 射线数量
+            max_range: 最大探测距离
+        """
+        self.map_points = map_points
+        self.num_rays = num_rays
+        self.max_range = max_range
+
+    def scan(self, x, y, theta):
+        """
+        模拟激光雷达扫描
+
+        Args:
+            x, y: 位置
+            theta: 偏航角
+
+        Returns:
+            scan_points: 扫描点云 (机体坐标系)
+        """
+        scan_points = []
+
+        # 简化：直接返回可见的地图点（转换到机体坐标系）
+        for map_point in self.map_points:
+            # 地图点在世界坐标系
+            px_world, py_world = map_point
+
+            # 转换到机体坐标系
+            dx = px_world - x
+            dy = py_world - y
+
+            # 旋转到机体坐标系
+            cos_theta = np.cos(-theta)
+            sin_theta = np.sin(-theta)
+            px_body = cos_theta * dx - sin_theta * dy
+            py_body = sin_theta * dx + cos_theta * dy
+
+            # 只保留前方的点
+            dist = np.sqrt(px_body**2 + py_body**2)
+            if dist < self.max_range and dist > 0.5:  # 忽略太近的点
+                scan_points.append([px_body, py_body])
+
+        # 限制点数，避免太多
+        if len(scan_points) > self.num_rays:
+            indices = np.random.choice(len(scan_points), self.num_rays, replace=False)
+            scan_points = [scan_points[i] for i in indices]
+
+        return np.array(scan_points) if len(scan_points) > 0 else np.array([[0, 0]])
 
 
 class IESKF_2D:
@@ -85,32 +142,74 @@ class IESKF_2D:
         # 协方差预测: P = F*P*F^T + G*Q*G^T
         self.P = F @ self.P @ F.T + G @ Q @ G.T
 
-    def update(self, z_x, z_y, R_meas):
+    def update_with_lidar(self, scan_points, lidar):
         """
-        迭代更新步骤: 位置测量
+        迭代更新步骤: 2D激光雷达点云配准
 
-        这是IESKF的核心创新!
+        这是IESKF的核心创新! 参考FAST-LIO2
 
-        输入:
-            z_x, z_y: 位置测量
-            R_meas: 测量噪声方差
+        Args:
+            scan_points: 当前扫描点云 (机体坐标系)
+            lidar: Lidar2D对象
         """
         # 保存先验状态 (迭代前的状态)
         state_prior = [self.x, self.y, self.vx, self.vy, self.theta]
 
-        # 测量矩阵 H (观测位置)
-        H = np.array([[1, 0, 0, 0, 0],   # 观测x
-                      [0, 1, 0, 0, 0]])  # 观测y
-
-        R = np.eye(2) * R_meas
-
         print("  迭代更新过程:")
-        for i in range(self.max_iter):
-            # ===== 计算残差 =====
-            # r = 测量值 - 预测值
-            r = np.array([z_x - self.x, z_y - self.y])
+        for iteration in range(self.max_iter):
+            # ===== 计算残差和雅可比 =====
+            residuals = []
+            jacobians = []
+
+            # 将扫描点转换到世界坐标系
+            cos_theta = np.cos(self.theta)
+            sin_theta = np.sin(self.theta)
+
+            for p_body in scan_points:
+                # 转换到世界坐标系
+                p_world = np.array([
+                    cos_theta * p_body[0] - sin_theta * p_body[1] + self.x,
+                    sin_theta * p_body[0] + cos_theta * p_body[1] + self.y
+                ])
+
+                # 找最近的地图点
+                distances = np.linalg.norm(lidar.map_points - p_world, axis=1)
+                nearest_idx = np.argmin(distances)
+                q_nearest = lidar.map_points[nearest_idx]
+
+                # 残差: 点到最近地图点的向量
+                diff = p_world - q_nearest
+                dist = np.linalg.norm(diff)
+
+                if dist > 1e-6 and dist < 5.0:  # 限制最大距离，避免异常值
+                    # 法向量 (指向扫描点)
+                    normal = diff / dist
+                    # 残差: 点到面的有符号距离 (可正可负)
+                    r = normal @ diff  # 有符号距离
+                    residuals.append(r)
+
+                    # 雅可比矩阵
+                    # dr/dx = n_x, dr/dy = n_y
+                    # dr/dθ = n^T * [-sin(θ)*p_x - cos(θ)*p_y, cos(θ)*p_x - sin(θ)*p_y]
+                    J = np.zeros(5)
+                    J[0] = normal[0]  # dr/dx
+                    J[1] = normal[1]  # dr/dy
+                    J[4] = normal[0] * (-sin_theta * p_body[0] - cos_theta * p_body[1]) + \
+                           normal[1] * (cos_theta * p_body[0] - sin_theta * p_body[1])  # dr/dθ
+                    jacobians.append(J)
+
+            if len(residuals) == 0:
+                print("    警告: 没有有效的扫描点")
+                return
+
+            # 转换为数组
+            r = np.array(residuals)
+            H = np.array(jacobians)
 
             # ===== 计算Kalman增益 =====
+            # 测量噪声
+            R = np.eye(len(r)) * 0.1  # 点云测量噪声
+
             # K = P * H^T * (H*P*H^T + R)^{-1}
             S = H @ self.P @ H.T + R
             K = self.P @ H.T @ np.linalg.inv(S)
@@ -127,21 +226,21 @@ class IESKF_2D:
 
             # ===== 检查收敛 =====
             dx_norm = np.linalg.norm(dx)
-            print(f"    迭代{i+1}: 残差||r||={np.linalg.norm(r):.4f}, 更新||dx||={dx_norm:.6f}")
+            r_norm = np.linalg.norm(r)
+            print(f"    迭代{iteration+1}: 残差||r||={r_norm:.4f}, 更新||dx||={dx_norm:.6f}")
 
             if dx_norm < self.tol:
                 print(f"    ✓ 收敛!")
                 break
 
         # ===== 更新协方差 (Joseph形式) =====
-        # 保证数值稳定性: P = (I-KH)*P*(I-KH)^T + K*R*K^T
         I_KH = np.eye(5) - K @ H
         self.P = I_KH @ self.P @ I_KH.T + K @ R @ K.T
 
 
 def test_ieskf():
     """
-    单一测试案例: 一般运动模式
+    单一测试案例: 2D激光雷达SLAM
 
     运动过程:
     1. 0-3秒: 匀速直线
@@ -149,7 +248,7 @@ def test_ieskf():
     3. 6-10秒: 转弯
     """
     print("=" * 80)
-    print("2D IESKF 测试: 一般运动模式")
+    print("2D IESKF 测试: 激光雷达SLAM")
     print("=" * 80)
 
     # 参数
@@ -157,10 +256,35 @@ def test_ieskf():
     T = 10.0   # 10秒
     N = int(T / dt)
 
-    # 初始化
-    kf = IESKF_2D()
+    # ===== 生成地图 =====
+    # 创建一个简单的室内环境 (墙壁)
+    map_points = []
 
-    # 真实状态
+    # 外墙 (矩形房间)
+    room_size = 30
+    wall_density = 100
+    for i in range(wall_density):
+        # 四面墙
+        x = -room_size/2 + i * room_size / wall_density
+        map_points.append([x, -room_size/2])  # 下墙
+        map_points.append([x, room_size/2])   # 上墙
+
+        y = -room_size/2 + i * room_size / wall_density
+        map_points.append([-room_size/2, y])  # 左墙
+        map_points.append([room_size/2, y])   # 右墙
+
+    map_points = np.array(map_points)
+
+    # 初始化激光雷达
+    lidar = Lidar2D(map_points, num_rays=180, max_range=20.0)
+
+    # 初始化滤波器
+    kf = IESKF_2D()
+    # 从房间中心开始
+    kf.x = 0.0
+    kf.y = 0.0
+
+    # 真实状态 (从房间中心开始)
     true_state = {'x': 0.0, 'y': 0.0, 'vx': 1.0, 'vy': 0.5, 'theta': 0.0}
 
     # 记录数据
@@ -169,9 +293,10 @@ def test_ieskf():
     times = []
 
     # 测量间隔
-    meas_interval = 10  # 10Hz (增加测量频率)
+    meas_interval = 10  # 10Hz
 
-    print(f"\n参数: IMU={1/dt:.0f}Hz, 测量={1/(dt*meas_interval):.0f}Hz, 时长={T:.0f}s\n")
+    print(f"\n参数: IMU={1/dt:.0f}Hz, LiDAR={1/(dt*meas_interval):.0f}Hz, 时长={T:.0f}s")
+    print(f"地图点数: {len(map_points)}\n")
 
     # 主循环
     for i in range(N):
@@ -219,16 +344,18 @@ def test_ieskf():
 
         # ===== 测量更新 =====
         if (i + 1) % meas_interval == 0:
-            # 生成位置测量 (添加噪声)
-            z_x = true_state['x'] + np.random.randn() * 0.05  # 测量噪声 0.05m
-            z_y = true_state['y'] + np.random.randn() * 0.05
+            # 生成激光雷达扫描 (从真实位置)
+            scan_points = lidar.scan(true_state['x'], true_state['y'], true_state['theta'])
 
-            print(f"t={t:.2f}s: 测量更新")
+            # 添加测量噪声
+            scan_points += np.random.randn(*scan_points.shape) * 0.02
+
+            print(f"t={t:.2f}s: LiDAR扫描更新")
             print(f"  真实: ({true_state['x']:.2f}, {true_state['y']:.2f})")
-            print(f"  测量: ({z_x:.2f}, {z_y:.2f})")
             print(f"  预测: ({kf.x:.2f}, {kf.y:.2f})")
+            print(f"  扫描点数: {len(scan_points)}")
 
-            kf.update(z_x, z_y, R_meas=0.0025)  # 测量噪声方差 0.05^2 = 0.0025
+            kf.update_with_lidar(scan_points, lidar)
 
             print(f"  更新后: ({kf.x:.2f}, {kf.y:.2f})\n")
 
@@ -245,20 +372,21 @@ def test_ieskf():
     print(f"\n统计: 误差均值={np.mean(errors):.4f}m, 最大={np.max(errors):.4f}m")
 
     # 可视化
-    plot_results(times, traj_est, traj_true, errors)
+    plot_results(times, traj_est, traj_true, errors, map_points)
 
 
-def plot_results(times, traj_est, traj_true, errors):
+def plot_results(times, traj_est, traj_true, errors, map_points):
     """可视化结果"""
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-    # 轨迹
+    # 轨迹 + 地图
+    axes[0].scatter(map_points[:, 0], map_points[:, 1], c='gray', s=1, alpha=0.3, label='Map')
     axes[0].plot(traj_true[:, 0], traj_true[:, 1], 'b-', lw=2, label='True')
     axes[0].plot(traj_est[:, 0], traj_est[:, 1], 'r--', lw=1.5, label='Estimated')
     axes[0].scatter(traj_true[0, 0], traj_true[0, 1], c='g', s=100, marker='o', label='Start')
     axes[0].set_xlabel('X [m]')
     axes[0].set_ylabel('Y [m]')
-    axes[0].set_title('Trajectory Comparison')
+    axes[0].set_title('Trajectory with Map')
     axes[0].legend()
     axes[0].grid(True)
     axes[0].axis('equal')
