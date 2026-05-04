@@ -7,6 +7,27 @@
 3. **位置向量**: `p_XinY` — 坐标系 X 原点在坐标系 Y 中的坐标
 4. **相机-IMU外参**: `T_imu_cam` — 旋转 `R_CtoI`，平移 `p_CinI`
 
+### 坐标系定义
+
+| 符号 | 名称 | 说明 |
+|------|------|------|offset_R_L_I ↔ R_LtoI (状态中的外参旋转)
+offset_T_L_I ↔ p_LinI (状态中的外参平移)
+| I | IMU | IMU本体坐标系 |
+| L | LiDAR | 激光雷达坐标系 |
+| C | Camera | 相机坐标系 |
+| W | World | 世界坐标系（固定坐标系） |
+| G | Global | 全局坐标系（与W等价，用于VIO） |
+| B | Base | 机器人基座坐标系（用于重力对齐） |
+
+### 代码变量名与数学符号对应关系
+
+| 代码变量名 | 数学符号 | 说明 |
+|-----------|---------|------|
+| `Lidar_R_wrt_IMU` | `R_LtoI` | LiDAR到IMU的旋转 |
+| `Lidar_T_wrt_IMU` | `p_LinI` | LiDAR原点在IMU坐标系中的位置 |
+| `offset_R_L_I` | `R_LtoI` | 状态中的外参旋转 |
+| `offset_T_L_I` | `p_LinI` | 状态中的外参平移 |
+
 ---
 
 ## Assumptions (需确认)

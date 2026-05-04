@@ -57,3 +57,16 @@ daily/
 
 # Prompt
 prompt
+
+# Deep learning training outputs
+*.pth
+*.pt
+*.ckpt
+*.log
+*.log.json
+events.out.tfevents.*
+*.tfevents.*
+
+# TensorBoard logs
+events.*
+runs/
