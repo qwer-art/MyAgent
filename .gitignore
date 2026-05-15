@@ -1,6 +1,5 @@
 # Raw data directories
-raw_paper/
-raw_code/
+raw_data/
 
 # Working directories
 workdirs/
@@ -55,10 +54,11 @@ daily/
 # PDF files
 *.pdf
 
-# Prompt
-prompt
+# Prompt (不用git管理)
+prompt/
 
-# Deep learning training outputs
+# Other (待确认归类)
+other/
 *.pth
 *.pt
 *.ckpt
