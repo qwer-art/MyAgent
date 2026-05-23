@@ -1,6 +1,9 @@
 # Raw data directories
 raw_data/
 
+# Outputs
+outputs/
+
 # Working directories
 workdirs/
 
