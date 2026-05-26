@@ -30,7 +30,7 @@
 | 1 | 输入(观测空间) | 人可理解的具体数据: 图像/语言/状态/动作 | `#E8F5E9` | `#2E7D32` | box, rounded |
 | 2 | KV Cache | 键值缓存, 存储 prefix 上下文, 有动态维度 | `#F3E5F5` | `#7B1FA2` | cylinder |
 | 3 | 编码(特征向量) | 人不可理解的高维张量, dim≈1024/2048 | `#E3F2FD` | `#1565C0` | box, rounded |
-| 4 | 融合 | 编码特征的交汇点: concat/mask/插值/积分 | `#FFF3E0` | `#E65100` | box, rounded |
+| 4 | 融合 | 编码特征的交汇点, 见下方融合策略说明 | `#FFF3E0` | `#E65100` | box, rounded |
 | 5 | 控制信号 | 时间步条件, 驱动去噪行为, 非观测来源 | `#FFFDE7` | `#F57F17` | box, rounded |
 | 6 | 输出(动作空间) | 人可理解的具体动作: 7-DoF 序列 | `#FCE4EC` | `#C62828` | box, rounded |
 
@@ -44,17 +44,116 @@
 
 ### 每个节点的标注规范
 
-每个节点必须包含:
-1. **模块名称** (人可理解的功能描述)
-2. **输入→输出维度** (张量 shape, 含具体数值)
-3. **数据范围** (值域, 如 [0,1], [-1,1], N(0,I) 等)
-4. **关键操作** (如 GQA 8Q/1KV, GeGLU, adaRMSNorm 等结构细节)
+每个节点必须包含 3 项信息, 繁简有度:
+
+1. **泛化处理方式** — 功能类别 (1~3 词), 如 `vision-encoder` / `traj-tokenizer` / `action-head`
+2. **具体实现** — 行业术语或模型名 (1~3 词), 如 `SigLIP2` / `Qwen3-VL` / `DCT+BPE` / `FM (flow matching)`; 速查表见下方
+3. **输出张量** — 名称 + shape, 如 `img_tokens, [B,160,1280]` / `traj_tokens, [B,48,1024]`
+
+**格式**: 节点标签按 `泛化处理方式\n具体实现\n输出张量` 三行排列。
+
+**示例**:
+```
+Vision Encoder
+SigLIP2 + 2x downsample
+img_tokens, [B,960,1280]
+```
+```
+DeltaTrajectoryTokenizer
+delta-quantize, vocab=1000
+traj_tokens, [B,48,1024]
+```
 
 ### 边的标注规范
 
 每条边必须标注:
 1. **张量维度** (传递的数据 shape)
 2. **关键变化** (如 "uint8→float32", "HWC→CHW", "712 prefix tokens")
+
+### 融合策略术语
+
+融合节点不仅要标注泛称（如 "Token Fusion"），还必须注明具体的融合方式。常见策略:
+
+| 术语 | 做法 | 代表模型 |
+|------|------|----------|
+| **Early Fusion** (via Token Concatenation) | 各模态 token 在进入 Transformer 前顺序拼接为单一序列, 由 self-attention 自学跨模态关系 | LLaVA, RT-2, Alpamayo |
+| **Late Fusion** | 各模态独立编码, 在输出层融合特征向量 | 双流网络 |
+| **Cross-Attention Fusion** | 一个模态通过 cross-attention 访问另一模态的 KV, 非对称交互 | Flamingo, Pi0 (action expert) |
+| **Gated Fusion** | 可学习门控系数加权混合各模态特征 | — |
+
+**节点标注要求**: 节点名称写泛称 (如 "Token Fusion"), 节点描述中用术语标注具体策略 (如 "Early Fusion via Token Concatenation: img\|text\|traj → input_ids")。
+
+### 行业术语速查表
+
+节点中涉及的模块如有行业共识的标准缩写, 必须在节点描述中标注 (格式: `缩写 全称`), 不可只用自造名称。按功能分类:
+
+**视觉编码器:**
+
+| 缩写 | 全称 | 典型用途 |
+|------|------|----------|
+| ViT | Vision Transformer | 通用视觉编码 backbone |
+| SigLIP | Sigmoid Loss Language-Image Pre-training | 对比学习视觉编码, 替代 CLIP |
+| CLIP | Contrastive Language-Image Pre-training | 对比学习视觉编码 |
+| DINOv2 | Self-distillation with No Labels v2 | 自监督视觉编码, 无需文本 |
+| ViTDet | Vision Transformer Detector | 检测专用 ViT |
+| SAM | Segment Anything Model | 通用分割 |
+
+**语言模型 backbone:**
+
+| 缩写 | 全称 | 典型用途 |
+|------|------|----------|
+| LLM | Large Language Model | 通用语言 backbone |
+| VLM | Vision-Language Model | 多模态语言 backbone |
+| LLaMA | Large Language Model Meta AI | Meta 开源 LLM 系列 |
+| Qwen-VL | 通义千问-VL | 阿里多模态 LLM |
+| PaLM-E | Pathways Language Model - Embodied | Google 具身 LLM |
+
+**动作/轨迹编码:**
+
+| 缩写 | 全称 | 典型用途 |
+|------|------|----------|
+| FM | Flow Matching | 连续归一化流, 用于动作去噪 |
+| DDPM | Denoising Diffusion Probabilistic Model | 离散扩散去噪 |
+| CVAE | Conditional Variational Autoencoder | 条件 VAE, 动作建模 |
+| ACT | Action Chunking with Transformers | 分块动作预测 |
+| DiT | Diffusion Transformer | Transformer 架构的扩散模型 |
+
+**位置/时间编码:**
+
+| 缩写 | 全称 | 典型用途 |
+|------|------|----------|
+| RoPE | Rotary Position Embedding | 旋转位置编码 |
+| PE | Position Embedding | 位置编码 (泛称) |
+| Fourier PE | Fourier Position Embedding | 傅里叶位置编码, 用于连续值 (时间步/坐标) |
+
+**注意力/融合:**
+
+| 缩写 | 全称 | 典型用途 |
+|------|------|----------|
+| GQA | Grouped-Query Attention | 分组查询注意力, KV 共享 |
+| MLA | Multi-head Latent Attention | DeepSeek 多头潜注意力 |
+| Cross-Attn | Cross-Attention | 跨模态注意力 |
+| Self-Attn | Self-Attention | 自注意力 |
+| Flash-Attn | Flash Attention | 高效注意力实现 |
+
+**归一化/激活:**
+
+| 缩写 | 全称 | 典型用途 |
+|------|------|----------|
+| RMSNorm | Root Mean Square Normalization | RMS 归一化, 替代 LayerNorm |
+| adaLN | Adaptive Layer Normalization | 自适应归一化, 条件注入 |
+| GeGLU | GeLU Gated Linear Unit | 门控激活函数 |
+| SiLU | Sigmoid Linear Unit | SiLU 激活函数 |
+
+**量化/分词:**
+
+| 缩写 | 全称 | 典型用途 |
+|------|------|----------|
+| BPE | Byte-Pair Encoding | 文本分词 |
+| VQ-VAE | Vector Quantized VAE | 离散化编码, 动作 token 化 |
+| FSQ | Finite Scalar Quantization | 有限标量量化 |
+
+**标注示例**: 节点名称 `Vision Encoder`, 描述中写 `SigLIP2 + 2x downsample` 而非仅写 `视觉编码器 + 下采样`。
 
 ### 跨阶段连接
 
@@ -109,7 +208,9 @@ OUTPUT_NODE = {'shape': 'box', 'style': 'rounded,filled', 'fillcolor': '#FCE4EC'
 SAMPLE_NODE = {'shape': 'box', 'style': 'rounded,filled', 'fillcolor': '#F1F8E9', 'fontsize': '11'}
 LOSS_NODE = {'shape': 'box', 'style': 'rounded,filled', 'fillcolor': '#FFCDD2', 'fontsize': '12'}
 
-# 每个节点必须标注: 模块名 + 输入→输出维度 + 值域 + 关键操作
+# 每个节点三行: 泛化处理方式 / 具体实现 / 输出张量
+# 示例: "Vision Encoder\nSigLIP2 + 2x downsample\nimg_tokens, [B,960,1280]"
+# 融合节点具体实现必须标注策略术语: Early Fusion / Cross-Attn Fusion / Late Fusion / Gated Fusion
 # 每条边必须标注: 张量维度 + 关键变化
 # 时间主轴: 推理用 Phase 1/2, 训练用单次前向+Loss
 # 特征子分类: Image Stream / Language Stream / Action Stream / Time Control
